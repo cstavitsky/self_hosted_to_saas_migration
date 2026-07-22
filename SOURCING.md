@@ -12,27 +12,27 @@ managed/dedicated hosting). It expands on the "How the data flows" section of th
    its objects in SaaS. These tools **never contact the self-hosted instance** — once you have the file you
    can run them fully offline from the source.
 
-2. **Live self-hosted REST API (read-only).** Some settings the relocation export does not carry (org
-   governance/privacy flags, per-project settings, data scrubbers). The **settings** tools read those from
-   the running self-hosted instance via [`common/selfhosted_source.py`](common/selfhosted_source.py) and
-   write them to SaaS. These tools **do not read the export file at all**.
+The **project settings** tool ([`project-settings/`](project-settings/)) also reads this same export file
+via [`common/export_source.py`](common/export_source.py) — parsing each project's `sentry.projectoption`
+rows — and applies them to SaaS. There is **no second source**: the entire migration is export-driven and
+never contacts the self-hosted instance.
 
-Both sources ultimately write to SaaS using `SAAS_TOKEN`.
+Everything writes to SaaS using `SAAS_TOKEN`.
 
 ## Which step uses which source
 
-| Step | Tool(s) | Source | Needs the export file | Needs live self-hosted API + `SH_TOKEN` |
-|------|---------|--------|:---------------------:|:---------------------------------------:|
+| Step | Tool(s) | Source | Needs the export file | Needs live self-hosted API |
+|------|---------|--------|:---------------------:|:--------------------------:|
 | 1 — pre-flight | `preflight/duplicates_report.py` | export | yes | no |
 | 3 — core | `core/*.py` (projects, teams, members, membership, alerts) | export | yes | no |
-| 4 — settings | `org-settings/`, `project-settings/`, `data-scrubbers/` | live API | no | yes |
+| 4 — settings | `project-settings/` (settings, grouping rules, scrubbers, inbound filters) | export | yes | no |
 
 Consequences:
 
-- A **core-only** migration (Steps 1 + 3) needs **only the JSON file(s)** — no network path to the
-  self-hosted instance, no `SH_TOKEN`.
-- **Settings** (Step 4) need network reachability to the self-hosted API (`--source-url "$SRC_URL"`, direct
-  or via VPN, valid TLS) and an `SH_TOKEN` minted on that instance. They do **not** need the export.
+- The **whole migration** needs **only the JSON file(s)** — no network path to the self-hosted instance and
+  no self-hosted token at any step.
+- **Org-level settings are out of scope**: org governance / org-level scrubbing defaults live in
+  `sentry.organizationoption`, which the relocation export does not reliably carry, so they are not migrated.
 
 ## Producing the export (Step 0)
 

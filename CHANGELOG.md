@@ -6,6 +6,36 @@ All notable changes to the migration scripts, relative to the upstream baseline
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/). This project uses the
 upstream fork's own history, not semver releases; the core-scope checkpoint is tagged `v1.0-core`.
 
+## [Unreleased] - settings made export-only; org-level removed
+
+Consolidated the settings migration to be **100% export-driven** and scoped **out** org-level settings.
+See DECISIONS.md **D9**.
+
+### Added
+
+- `common/export_source.py` (new): shared read-only parser for a relocation export. Builds per-project
+  `sentry.projectoption` dicts, decoding the export's mixed native/JSON-encoded option values.
+- `migrate_project_settings.py`: now migrates, from the export, **custom grouping rules**
+  (`groupingEnhancements`, `fingerprintingRules`), **standard project-level data scrubbers** (folded in
+  from the old data-scrubbers tool), the **custom error-message filter**, and the **five toggle inbound
+  filters** (via the dedicated `/filters/` endpoint), each replicated to its exact state. Per-project
+  accounting: `applied` / `filters_applied` / `excluded_advanced` / `skipped` / `unhandled`.
+
+### Changed
+
+- `migrate_project_settings.py` is now **export-driven** (`--export-file`) instead of live-API. Dropped
+  `--source-token` / `--source-url`; `--source-org` is now an optional filter for multi-org export files.
+  Grouping algorithm *version* (`sentry:grouping_config`) remains intentionally skipped.
+
+### Removed
+
+- `org-settings/` (`migrate_org_settings.py`) — **org-level settings are out of scope** (org options
+  aren't reliably carried by the export).
+- `data-scrubbers/` (`migrate_data_scrubbers.py`) — project-level scrubbers folded into
+  `migrate_project_settings.py`; org-level scrubbers dropped with the rest of org-level scope.
+- `common/selfhosted_source.py` — the live self-hosted reader; no tool uses a live API anymore, so no
+  self-hosted token or network reachability to the instance is required for any step.
+
 ## [v1.0-core] - 2026-07-08
 
 Core-scope migration hardened and verified end-to-end (Projects, Teams & Membership, Alert Rules)

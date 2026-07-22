@@ -4,7 +4,25 @@ A running record of scope/design choices made per feature -- especially things w
 deferred or excluded and may want to revisit. Newest first. Each entry: what was decided, why, and
 what would change it.
 
+## D10 - Export-only; org-level settings out of scope; scrubbers folded into project-settings
+
+- Feature: `feat/project-settings` (consolidation)
+- Decision: the settings migration is now **100% export-driven**. The live self-hosted reader
+  (`common/selfhosted_source.py`) and the two live-API tools (`org-settings/`, `data-scrubbers/`) were
+  **removed**. Project-level data scrubbers were **folded into `migrate_project_settings.py`** (they're
+  flat project-detail fields sourced from `sentry.projectoption`). **Org-level settings are out of scope.**
+- Why: the customer's migration is offline/export-based, so requiring a live self-hosted token + network
+  reachability for a few settings wasn't worth it. Org-level options (`sentry.organizationoption` — org
+  governance, org-level scrubbing defaults) aren't reliably carried by the relocation export, so they
+  can't be sourced offline; rather than keep a live-API path for org-level alone, org-level was dropped.
+- Consequences: one settings command instead of three; no `SH_TOKEN`/`--source-url` anywhere; the
+  export-only caveat applies (only non-default `projectoption` rows are present, so untouched settings stay
+  at the SaaS default). Supersedes the org-level parts of D3 and D5 and the tool split implied by D4.
+- Revisit if: org-level governance/scrubbing must be migrated (would need a re-introduced live reader or a
+  richer export), or advanced custom-PII is needed (still deferred per D5).
+
 ## D9 - Issue alerts migrated; notification action defaulted to the owner team (supersedes D1)
+
 - Feature: `feat/issue-alerts`
 - Decision: migrate issue alerts (`sentry.rule`) alongside metric alerts via
   `/projects/{org}/{project}/rules/`. Carry over each rule's `conditions`/`filters`/`actionMatch`/
@@ -19,6 +37,7 @@ what would change it.
   users) -- that needs an integration/user id mapping layer, a follow-up beyond this feature.
 
 ## D8 - Ship distinct, separately-run tools; no single orchestrating wizard
+
 - Feature: delivery model (affects `feat/wizard`, now dropped as the default path)
 - Decision: the toolkit is delivered as **distinct tools the operator runs one at a time, in a
   documented order**, not a single guided `migrate.py` that chains all steps. Each tool does one data
@@ -30,6 +49,7 @@ what would change it.
   wrapper over the same tools, never as the default, and still dry-run-first per step.
 
 ## D7 - Duplicates report is export-based (offline) for now; live multi-org reader deferred
+
 - Feature: `feat/duplicates-report`
 - Decision: the duplicates/collision report reads **JSON export files** (one per self-hosted org) and
   compares them offline. It does **not** talk to a live self-hosted instance. Scope is names/slugs plus
@@ -42,6 +62,7 @@ what would change it.
   Those are follow-ups, not part of this tool's v1.
 
 ## D5 - Data scrubbers: standard fields only, advanced custom-PII deferred
+
 - Feature: `feat/data-scrubbers`
 - Decision: migrate the **standard** data-scrubbing settings at both org and project level
   (`dataScrubber`, `dataScrubberDefaults`, `sensitiveFields`, `safeFields`, `scrubIPAddresses`,
@@ -53,6 +74,7 @@ what would change it.
   needs them carried over. Would be a follow-up (e.g. `feat/data-scrubbers-advanced`).
 
 ## D4 - Project matching is by name (greenfield assumption)
+
 - Feature: `feat/project-settings` (and reused by `feat/data-scrubbers`)
 - Decision: pair self-hosted -> SaaS projects by **name** (case-insensitive); PUT to the destination's
   own slug. Unmatched projects are skipped and reported, never guessed.
@@ -63,6 +85,7 @@ what would change it.
   report + policy + provenance) in ROADMAP.
 
 ## D3 - Organization settings: require2FA skipped
+
 - Feature: `feat/org-settings`
 - Decision: do not migrate `require2FA`.
 - Why: enabling it on the destination could lock out members who don't yet have 2FA set up.
@@ -70,6 +93,7 @@ what would change it.
   first). Recorded in the results file as skipped, not silently dropped.
 
 ## D2 - Member roles flattened to "member" at invite time
+
 - Feature: core (phase-2)
 - Decision: all migrated members are invited as `member`.
 - Why: internal-integration tokens can only invite at the `member` role.
@@ -77,6 +101,7 @@ what would change it.
   needs a `member:admin` token).
 
 ## D1 - Alerts: metric alerts only ~~(SUPERSEDED by D9)~~
+
 - Feature: core (phase-2)
 - Decision (original): migrate metric alert rules; issue alerts (`sentry.rule`) are detected and reported as
   skipped, not migrated. Notification actions are not preserved (a default action is injected).

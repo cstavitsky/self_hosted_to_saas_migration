@@ -35,12 +35,13 @@ def load_export(path):
 
 
 def project_slug_by_pk(data):
-    return {o["pk"]: o["fields"]["slug"] for o in data if o["model"] == "sentry.project"}
+    return {o["pk"]: o["fields"]["slug"] for o in data
+            if isinstance(o, dict) and o.get("model") == "sentry.project"}
 
 
 def find_rule(data, label):
     for o in data:
-        if o["model"] == "sentry.rule" and o["fields"].get("label") == label:
+        if isinstance(o, dict) and o.get("model") == "sentry.rule" and o["fields"].get("label") == label:
             return o
     return None
 
@@ -77,6 +78,7 @@ def create_rule(token, org, slug, payload, dry_run):
         body = {}
     if r.status_code == 202 and "uuid" in body:
         return poll_task(token, org, slug, body["uuid"])
+    print(f"  ERROR {r.status_code}: {r.text[:500]}")
     r.raise_for_status()
     return body
 
@@ -104,6 +106,10 @@ def main():
     ap.add_argument("--only", required=True, help="alert label to migrate")
     ap.add_argument("--workspace", help="SaaS Slack integration id (auto-detected if one exists)")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--rebind-channel", action="store_true",
+                    help="Drop the source channel_id so SaaS resolves the Slack action by channel "
+                         "NAME instead. Use when testing against a DIFFERENT workspace (e.g. a dummy), "
+                         "where the original channel_id does not exist.")
     args = ap.parse_args()
 
     data = load_export(args.export_file)
@@ -140,15 +146,20 @@ def main():
         print(f"Destination Slack integration: id={saas_ws} "
               f"name={integs[0].get('name')} domain={integs[0].get('domainName')}")
 
-    # Rewrite ONLY the instance-specific workspace id; keep channel + channel_id
+    # Rewrite ONLY the instance-specific workspace id; keep channel (+ channel_id unless rebinding)
     new_action = dict(slack_action)
     new_action["workspace"] = str(saas_ws)
     new_action.pop("uuid", None)  # let SaaS assign a fresh one
+    if args.rebind_channel:
+        removed = new_action.pop("channel_id", None)
+        print(f"--rebind-channel: dropped source channel_id={removed}; "
+              f"SaaS will resolve by name {new_action.get('channel')!r}")
 
     payload = {
         "name": fields.get("label"),
         "actionMatch": blob.get("action_match", "any"),
-        "filterMatch": blob.get("filter_match", "all"),
+        # filter_match may be present-but-null in the export; SaaS rejects null, so coerce to "all"
+        "filterMatch": blob.get("filter_match") or "all",
         "frequency": blob.get("frequency", 30),
         "conditions": blob.get("conditions", []),
         "filters": blob.get("filters", []),

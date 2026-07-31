@@ -6,6 +6,139 @@ All notable changes to the migration scripts, relative to the upstream baseline
 Format loosely follows [Keep a Changelog](https://keepachangelog.com/). This project uses the
 upstream fork's own history, not semver releases; the core-scope checkpoint is tagged `v1.0-core`.
 
+## [Unreleased] - merge-collision guard + project create hardening
+
+Added support for merging a second self-hosted instance (e.g. v24) into a SaaS org that already
+holds a first instance (e.g. v25), plus resilience fixes surfaced by the large v24 run.
+
+### Added
+
+- **Merge-collision guard.** `collision_report.py` (new, read-only) compares an export against the
+  LIVE destination org and reports collisions, writing a `collision_skip_projects_*.json` skip-list.
+  A new `--skip-existing-projects FILE` flag on `create_sentry_projects.py`,
+  `migrate_project_settings.py`, and `migrate_alert_rules.py` consumes it so the second-instance run
+  **skips** colliding projects (and their settings + alerts) — first instance wins, nothing
+  overwritten. Teams need no flag: the assign-members step already MERGES members into an existing
+  team without overwriting. Off by default; single-instance runs are unaffected.
+- **`cleanup_alerts_and_monitors.py`** (new): clears metric alerts, issue alerts, cron monitors, and
+  `metric_issue` detectors from a test org (dry by default). Per-project "Error Monitor" detectors
+  are Sentry-managed and intentionally left alone (they cannot be deleted).
+
+### Fixed
+
+- **Invalid project platform no longer fails the whole project.** SaaS rejects unknown `platform`
+  values with `400 {"platform":["Invalid platform"]}` (e.g. v24's `javascript-browser`), which
+  previously sank the create. `platform` is cosmetic (icon/label only — no effect on ingestion,
+  DSNs, slug, or alerts), so `create_sentry_projects.py` now (1) maps known-bad values to their valid
+  equivalent (`javascript-browser` → `javascript`) and (2) as a safety net retries any other
+  server-rejected platform with `other`. Never downgrades an already-valid platform. Project name and
+  slug are unchanged.
+- **Already-existing members now map for team assignment.** When `add_sentry_members` hit a member who
+  already exists in the org (`400 "already been invited"` — shared across instances, or a prior run), it
+  recorded them as *failed* and left them out of the `user_mappings_for_teams` file, so
+  `assign_team_members` had no id for them and **skipped their team assignments**. It now looks up the
+  existing member's SaaS id (via a one-time cached listing of org members) and adds it to the mapping, so
+  those members are assigned to their teams. New `existing_mapped` stat + summary line. Fully backward
+  compatible: on a clean fresh org there are no pre-existing members, so nothing changes.
+
+## [Unreleased] - alert migration: transaction→span translation, Slack guard, payload fixes
+
+Hardened `core/migrate_alert_rules.py` for large multi-instance self-hosted exports. Translation rules for the
+span path were verified against the Sentry source (`src/sentry/incidents/metric_issue_detector.py`,
+`src/sentry/snuba/snuba_query_validator.py`, `src/sentry/snuba/models.py`, and
+`src/sentry/search/eap/spans/{aggregates,formulas,attributes}.py`).
+
+### Added
+
+- **Transaction → span (EAP) metric-alert translation** (always-on). SaaS has disabled creating
+  transaction-dataset metric alerts (`transactions` / `generic_metrics`); the script now rebuilds them
+  on the span dataset `events_analytics_platform`: aggregate `*(transaction.duration)` →
+  `*(span.duration)`, `count()` → `count(span.duration)`, `failure_rate()` → `failure_rate()`
+  (valid on spans, identical failure definition: `sentry.status NOT IN (ok, cancelled, unknown)`);
+  source query filters (`transaction:`, `tags[...]`) are carried over verbatim with `is_transaction:true`
+  appended; `eventTypes` set to `["trace_item_span"]`, `queryType` to `1`. Aggregates with no confirmed
+  span equivalent (web-vital `measurements.*`, custom `percentile()`, `percentage()`) are recorded in a
+  new `flagged_transaction_manual` results bucket instead of being sent to fail.
+- **`--override_slack_notifications_with_email=true|false`**: if any in-scope issue alert notifies
+  Slack, the run now errors (dry-run and live) unless a Slack integration id is supplied or this flag is
+  set to replace Slack actions with the default owner-team email.
+- **`--rebind-channel`**: drops a Slack action's source `channel_id` so a *different* (e.g. dummy test)
+  workspace resolves by channel name. Off by default; production/same-workspace runs keep `channel_id`.
+- **`seed_environments.py`** (new, test-org helper): sends benign seed events per (project, environment)
+  pair so environment-scoped alerts can be created in a fresh org — environments only exist once an
+  event has been ingested. Not part of a production migration.
+- **`create_slack_channels.py`** (new, test-only): creates the dummy-workspace Slack channels referenced
+  by the alerts, for real-time alert testing. Reads a user-supplied channel list (kept out of the repo).
+
+### Changed
+
+- Renamed `--only` to **`--target-alert`** (same exact-label, repeatable behavior).
+
+### Fixed
+
+- **Filter nodes rejected as conditions**: self-hosted stores condition and filter nodes together in
+  `conditions`; SaaS requires them split. Filter nodes (`sentry.rules.filters.*`) are now routed to the
+  `filters` field. (Recovered the largest issue-alert failure bucket.)
+- **`filterMatch: null`**: rules with no filters sent `null`, which SaaS rejects. Now coerced to `"all"`.
+- **User-owned metric alerts**: owner resolution now also maps `user_id` (via `--user-mappings`), so the
+  injected default action gets a valid target instead of a null `targetIdentifier`.
+- **Native EAP alert event types**: any `events_analytics_platform` alert (translated or native) now uses
+  `["trace_item_span"]`; the source event-type codes produced invalid EAP event types before.
+- **Metric-alert notification actions now migrate.** Previously the metric path never read the export's
+  actions — it always injected a default owner-team email, so Slack/PagerDuty/etc. targets were lost. It
+  now ports each trigger's `sentry.alertruletriggeraction` rows into the SaaS metric-alert trigger-action
+  schema (verified against Sentry source: `ActionService`/`ActionTarget` enums, `AlertRuleTriggerActionSerializer`):
+  Slack → `{type:slack, targetType:specific, targetIdentifier:'#channel', integrationId:<--slack-integration-id>}`
+  (honors `--rebind-channel`); email → `{type:email, targetType:user|team, targetIdentifier:<mapped id>}`.
+  Integration/app actions with no supplied mapping (PagerDuty/Opsgenie/MSTeams/Discord/SentryApp) and
+  raw-address `specific` emails are dropped and recorded (new `metric.dropped_actions` results bucket +
+  summary count). The default owner email is used only when a trigger has no portable action (e.g. an
+  older/scrubbed export with zero action rows). NOTE: requires an export that includes
+  `alertruletriggeraction` rows — scrubbed exports that strip them will still fall back to the owner email.
+- **Skip alert-rule snapshots.** Metric alerts with `status = SNAPSHOT` (4) are archival copies Sentry
+  keeps when a rule is edited; they have no project/subscription and can't migrate. They're now skipped
+  up front (new `metric.skipped_snapshot` bucket + summary count) instead of falling through to "No
+  project mapping" and inflating the failed count. On a large real export this moves 12 rows from
+  "failed" to "skipped (snapshot)" on every org run.
+
+### Notes / not yet validated live
+
+- Span translations are validated against the Sentry source, not a live API round-trip. First live run
+  should `--target-alert` one duration alert and one `failure_rate()` alert to confirm acceptance.
+- `extrapolation_mode` is not set (the classic `/alert-rules/` endpoint tolerates its absence); revisit
+  if a live run rejects on it. Exotic query fields (e.g. `transaction.op:`) map on spans in most cases
+  but are worth a live check.
+
+## [Unreleased] - settings made export-only; org-level removed
+
+Consolidated the settings migration to be **100% export-driven** and scoped **out** org-level settings.
+See DECISIONS.md **D9**.
+
+### Added
+
+- `common/export_source.py` (new): shared read-only parser for a relocation export. Builds per-project
+  `sentry.projectoption` dicts, decoding the export's mixed native/JSON-encoded option values.
+- `migrate_project_settings.py`: now migrates, from the export, **custom grouping rules**
+  (`groupingEnhancements`, `fingerprintingRules`), **standard project-level data scrubbers** (folded in
+  from the old data-scrubbers tool), the **custom error-message filter**, and the **five toggle inbound
+  filters** (via the dedicated `/filters/` endpoint), each replicated to its exact state. Per-project
+  accounting: `applied` / `filters_applied` / `excluded_advanced` / `skipped` / `unhandled`.
+
+### Changed
+
+- `migrate_project_settings.py` is now **export-driven** (`--export-file`) instead of live-API. Dropped
+  `--source-token` / `--source-url`; `--source-org` is now an optional filter for multi-org export files.
+  Grouping algorithm *version* (`sentry:grouping_config`) remains intentionally skipped.
+
+### Removed
+
+- `org-settings/` (`migrate_org_settings.py`) — **org-level settings are out of scope** (org options
+  aren't reliably carried by the export).
+- `data-scrubbers/` (`migrate_data_scrubbers.py`) — project-level scrubbers folded into
+  `migrate_project_settings.py`; org-level scrubbers dropped with the rest of org-level scope.
+- `common/selfhosted_source.py` — the live self-hosted reader; no tool uses a live API anymore, so no
+  self-hosted token or network reachability to the instance is required for any step.
+
 ## [v1.0-core] - 2026-07-08
 
 Core-scope migration hardened and verified end-to-end (Projects, Teams & Membership, Alert Rules)

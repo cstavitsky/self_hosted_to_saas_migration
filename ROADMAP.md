@@ -31,25 +31,21 @@ The toolkit is organized into per-tool subfolders, each with its own run-guide `
 ```
 migration/
   README.md ROADMAP.md DECISIONS.md CHANGELOG.md SOURCING.md
-  common/            selfhosted_source.py            (shared read-only self-hosted API client)
+  common/            export_source.py                (shared relocation-export parser)
+                     run_logging.py                  (shared run-log helper)
   preflight/         duplicates_report.py            (step 0: cross-org collision report)
   core/              create_sentry_projects.py create_sentry_teams.py
                      add_sentry_members.py assign_team_members.py migrate_alert_rules.py
-  org-settings/      migrate_org_settings.py
-  project-settings/  migrate_project_settings.py
-  data-scrubbers/    migrate_data_scrubbers.py
+  project-settings/  migrate_project_settings.py     (settings, grouping rules, scrubbers, inbound filters)
 ```
 
-The three settings tools import `common/selfhosted_source.py` via a small `sys.path` shim so each stays
-runnable directly from the repo root (`python3 org-settings/migrate_org_settings.py ...`).
+`project-settings/` imports `common/export_source.py` via a small `sys.path` shim so it stays runnable
+directly from the repo root (`python3 project-settings/migrate_project_settings.py ...`).
 
-## Two data sources
+## One data source: the relocation export
 
-The relocation export (`export organizations`) only carries a subset of models, so there are two sources:
-
-- **Export-driven** -- parse `export.json` (what phase-2 uses). Covers what the export contains.
-- **Live self-hosted reader** -- `selfhosted_source.py`, a read-only client for the running
-  self-hosted API (`http://127.0.0.1:9000/api/0`). Covers everything the export omits.
+The migration is **100% export-driven** -- everything is parsed from `export.json` (`export organizations`)
+via `common/export_source.py`. No tool reads a live self-hosted API, so no self-hosted token is needed.
 
 Confirmed against `migration-testing/export.json`:
 - In the export: `sentry.organization` (name, default_role, flags), `sentry.project` +
@@ -58,8 +54,10 @@ Confirmed against `migration-testing/export.json`:
 - NOT in the export: `sentry.organizationoption` (org data-scrubbing defaults, retention),
   `sentry.useroption`, `sentry.dashboard`, `sentry.monitor`, `sentry.repository`, `sentry.savedsearch`.
 
-New prereq for the live reader: a self-hosted auth token / internal integration with read scopes
-(`org:read`, `project:read`, `team:read`, `member:read`, `alerts:read`).
+Because org-level options aren't carried by the export, **org-level settings are out of scope** for this
+toolkit (the earlier live-API `org-settings`/`data-scrubbers` org path and `selfhosted_source.py` reader
+were removed -- see CHANGELOG). Project-level scrubbers, which *are* in the export, were folded into
+`project-settings`.
 
 ## Status
 
@@ -84,23 +82,28 @@ Pre-flight (run first, before any migration):
     output. A larger-scale test (seed Org2 to hundreds/thousands of projects) is a good follow-up before
     the real run.
 
-Foundation (do first):
+Foundation:
 
-- `feat/selfhosted-source` -- shared live self-hosted reader that later features depend on.
-  Introduced as `selfhosted_source.py` in `feat/org-settings` and extended per feature.
+- `common/export_source.py` -- shared relocation-export parser that the settings tool depends on
+  (replaced the earlier live self-hosted reader).
 
 Milestone: settings
 
-- `feat/org-settings` -- Organization settings (DONE, merged: governance + privacy whitelist)
-- `feat/project-settings` -- Projects and their settings (DONE, merged: core general-settings whitelist,
-  greenfield / match-by-name)
-- `feat/data-scrubbers` -- Enabled data scrubbers (DONE, merged: standard scrubbers, org + project;
-  advanced custom-PII excluded per DECISIONS.md D5)
+- `feat/project-settings` -- Per-project settings, now export-driven (DONE, merged). Covers general
+  settings, custom grouping rules (`groupingEnhancements`/`fingerprintingRules`; grouping *algorithm
+  version* excluded), standard project-level data scrubbers (folded in; advanced custom-PII excluded per
+  DECISIONS.md D5), the custom error-message filter, and the five toggle inbound filters.
+- ~~`feat/org-settings`~~ / ~~`feat/data-scrubbers`~~ -- REMOVED. Org-level settings are out of scope
+  (org options aren't in the export); project-level scrubbers were folded into `project-settings`.
 - `feat/member-roles` -- User accounts / member options (roles)
 - Teams and their settings -- verify-only (teams carry only name/slug/status; no dedicated branch
   unless org-level team roles warrant one)
 
-Milestone: content (all live-API sourced; depend on the reader)
+Milestone: content (future / not built)
+
+> NOTE: the sections below were originally scoped as **live-API sourced** and reference a "reader" that
+> has since been **removed** (the toolkit is now export-only). If/when these are built, they will each
+> need either a re-introduced live self-hosted reader or an export-based source. Left here as design notes.
 
 - `feat/monitors` -- Crons
 - `feat/dashboards` -- Dashboards (DONE: custom dashboards + widgets, live-API sourced, project remap by
@@ -146,38 +149,28 @@ Every feature reuses the phase-2 mapping files as foreign-key currency
 `*_results.json`, one new script file, core scripts untouched. Endpoint paths are best-known and to be
 confirmed during each build.
 
-### feat/selfhosted-source (foundation)
-- File: `selfhosted_source.py`. Read-only client for `http://127.0.0.1:9000/api/0` (auth, pagination,
-  errors). Mirror of the SaaS writer classes but GET-only.
-- Merges first; `feat/data-scrubbers` and all content features import it.
+### common/export_source.py (foundation)
+- File: `export_source.py`. Read-only parser for a relocation export (`{model, pk, fields}` list). Builds
+  per-project option dicts (decoding the export's mixed native/JSON-encoded values). Offline; no network.
+- The settings tool imports it. Replaced the removed live self-hosted reader (`selfhosted_source.py`).
 
-### feat/org-settings
-- Source: export `sentry.organization` (default_role, flags) + live GET `/organizations/{org}/`.
-- Target: PUT `/organizations/{org}/` (whitelist: `defaultRole`, `openMembership`,
-  `allowJoinRequests`, `enhancedPrivacy`; skip slug/features/plan).
-- Deps: destination org exists. Script: `migrate_org_settings.py`.
-
-### feat/project-settings (DONE)
-- Source: live GET `/organizations/{org}/projects/` then per-project GET `/projects/{org}/{proj}/`.
+### feat/project-settings (DONE, export-driven)
+- Source: parse the export via `common/export_source.py` -- each project's `sentry.projectoption` rows.
 - Matching (greenfield): pair source -> destination by project **name** (case-insensitive), then PUT
   using the destination's own slug (phase-2 reassigned slugs but preserved names). Source projects with
   no name match are skipped and reported; brownfield collision handling is deferred (see below).
-- Target: PUT `/projects/{org}/{proj}/`. Whitelist (core general settings): `resolveAge`,
-  `allowedDomains`, `scrapeJavaScript`, `verifySSL`, `subjectPrefix`, `subjectTemplate`,
-  `defaultEnvironment`, `highlightTags`, `highlightContext`. Data-scrubbing fields are deferred to
-  `feat/data-scrubbers`; identity/advanced/risky fields are skipped. Both groups are recorded per
-  project in the results file.
-- Deps: phase-2 projects + the live reader (`selfhosted_source.py`). Script:
-  `migrate_project_settings.py`. Needs a SaaS token with `project:write`.
-
-### feat/data-scrubbers (DONE)
-- Source: live GET `/organizations/{org}/` (org level) and per-project GET `/projects/{org}/{proj}/`.
-- Whitelist (standard, both levels): `dataScrubber`, `dataScrubberDefaults`, `sensitiveFields`,
-  `safeFields`, `scrubIPAddresses`, `storeCrashReports`. Advanced `relayPiiConfig` / `trustedRelays`
-  excluded (recorded, not dropped) -- see DECISIONS.md D5.
-- Matching: projects paired by name (reuses feat/project-settings). Target: PUT org + PUT each project.
-  `--org-only` / `--projects-only` scope flags. Deps: org + projects + the live reader. Script:
-  `migrate_data_scrubbers.py`. Needs a SaaS `org:write` + `project:write` token.
+- Target: PUT `/projects/{org}/{proj}/` for flat fields, plus PUT `/projects/{org}/{proj}/filters/{id}/`
+  for each toggle inbound filter. Whitelist:
+  - general: `resolveAge`, `allowedDomains`, `scrapeJavaScript`, `verifySSL`, `subjectPrefix`,
+    `subjectTemplate`, `defaultEnvironment`, `highlightTags`, `highlightContext`;
+  - grouping rules: `groupingEnhancements`, `fingerprintingRules` (algorithm *version* skipped);
+  - standard scrubbers (folded in): `dataScrubber`, `dataScrubberDefaults`, `sensitiveFields`,
+    `safeFields`, `scrubIPAddresses`, `storeCrashReports` (advanced `relayPiiConfig`/`trustedRelays`
+    excluded, recorded not dropped -- see DECISIONS.md D5);
+  - inbound filters: the custom error-message filter + the five toggle filters (browser-extensions,
+    legacy-browsers, web-crawlers, localhost, filtered-transaction), replicated to their exact state.
+  Every present option is accounted for per project in the results file (applied / excluded / skipped /
+  unhandled). Deps: phase-2 projects. Script: `migrate_project_settings.py`. Needs a SaaS `project:write` token.
 
 ### feat/member-roles
 - Source: export `sentry.organizationmember.role`.

@@ -45,7 +45,28 @@ class SentryMemberManager:
             logger.error(f"Failed to load export file {export_file_path}: {str(e)}")
             raise
 
-    def sync_members(self, export_file_path: str, org_slug: str) -> Dict[str, Dict]:
+    @staticmethod
+    def resolve_source_org_pk(data: List[Dict], source_org: str = None):
+        """Resolve which SOURCE org's records to migrate. An export may contain many orgs;
+        organizationmember records carry an `organization` FK (the source org pk). Returns that pk,
+        or None (no filter) only when the file holds a single org and no --source-org was given."""
+        orgs = {item.get('pk'): (item.get('fields') or {}).get('slug')
+                for item in data if isinstance(item, dict) and item.get('model') == 'sentry.organization'}
+        if source_org:
+            matches = [pk for pk, slug in orgs.items() if slug == source_org]
+            if not matches:
+                raise ValueError(f"--source-org '{source_org}' not found. Orgs in file: {sorted(filter(None, orgs.values()))}")
+            if len(matches) > 1:
+                raise ValueError(f"--source-org '{source_org}' is ambiguous (pks {matches} share this slug)")
+            return matches[0]
+        if len(orgs) > 1:
+            raise ValueError(
+                f"Export contains {len(orgs)} orgs {sorted(filter(None, orgs.values()))}; "
+                f"pass --source-org SLUG to migrate one at a time.")
+        return next(iter(orgs), None)
+
+    def sync_members(self, export_file_path: str, org_slug: str, source_org: str = None,
+                     team_mappings_out: str = 'user_mappings_for_teams.json') -> Dict[str, Dict]:
         """
         Add active users as members and track ID mappings
         """
@@ -68,18 +89,38 @@ class SentryMemberManager:
         
         try:
             data = self.load_export_data(export_file_path)
-            
+            source_pk = self.resolve_source_org_pk(data, source_org)
+            if source_pk is not None:
+                logger.info(f"Filtering to source org '{source_org or '(only org in file)'}' (pk {source_pk})")
+
             for item in data:
+                if not isinstance(item, dict):
+                    continue
                 if item.get('model') == 'sentry.organizationmember':
+                    fields = item.get('fields', {}) or {}
+                    if source_pk is not None and fields.get('organization') != source_pk:
+                        continue
                     internal_id = str(item.get('pk'))
-                    fields = item.get('fields', {})
-                    
+
                     # Only process active users
                     if not fields.get('user_is_active', False):
                         results['stats']['skipped'] += 1
                         continue
-                    
+
                     original_email = fields.get('user_email')
+                    # Members with no email can't be created (Sentry requires an email); skip with a
+                    # clear reason rather than letting the API reject them as a hard failure. This is
+                    # typically a never-accepted invite or a service/provisioned account.
+                    if not original_email:
+                        logger.warning(f"  SKIP: organizationmember pk {internal_id}: email is null in "
+                                       f"the export (likely a never-accepted invite or service account) "
+                                       f"-- cannot create member")
+                        results['stats']['skipped'] += 1
+                        results['id_mappings'].setdefault('skipped_no_email', {})[internal_id] = {
+                            'reason': 'email is null in export'
+                        }
+                        continue
+
                     email = self.generate_test_email(original_email, internal_id)
                     role = fields.get('role', 'member')
                     
@@ -116,7 +157,26 @@ class SentryMemberManager:
                         error_msg = str(e)
                         if hasattr(e, 'response') and hasattr(e.response, 'text'):
                             error_msg = e.response.text
-                        
+
+                        # Member already exists in the org (shared across instances, or a prior run).
+                        # Look up their existing SaaS id and map it so their TEAM ASSIGNMENTS still
+                        # apply — otherwise assign_team_members has no id for them and skips them.
+                        if ('already been invited' in error_msg) or ('already a member' in error_msg):
+                            existing_id = self.find_member_id_by_email(org_slug, email)
+                            if existing_id:
+                                results['id_mappings']['success'][internal_id] = {
+                                    'sentry_id': existing_id,
+                                    'email': email,
+                                    'original_email': original_email,
+                                    'preexisting': True,
+                                }
+                                team_assignment_mappings['user_mappings'][internal_id] = existing_id
+                                results['stats'].setdefault('existing_mapped', 0)
+                                results['stats']['existing_mapped'] += 1
+                                logger.info(f"Member already existed; mapped existing id {existing_id} "
+                                            f"for team assignment: {email}")
+                                continue
+
                         results['id_mappings']['failed'][internal_id] = {
                             'error': error_msg,
                             'email': email,
@@ -126,9 +186,10 @@ class SentryMemberManager:
                         logger.error(f"Failed to add member {email} (original: {original_email}): {error_msg}")
             
             # Write the team assignment mappings to a separate file
-            with open('user_mappings_for_teams.json', 'w') as f:
+            with open(team_mappings_out, 'w') as f:
                 json.dump(team_assignment_mappings, f, indent=2)
-            
+            logger.info(f"Wrote team-assignment mappings: {team_mappings_out}")
+
             return results
             
         except Exception as e:
@@ -228,56 +289,122 @@ class SentryMemberManager:
                 logger.error(f"Response: {e.response.text}")
             raise
 
+    @staticmethod
+    def _next_link(link_header):
+        if not link_header:
+            return None
+        for part in link_header.split(","):
+            if 'rel="next"' in part and 'results="true"' in part:
+                s, e = part.find("<"), part.find(">")
+                if s != -1 and e != -1:
+                    return part[s + 1:e]
+        return None
+
+    def _load_existing_members(self, org_slug: str):
+        """Fetch every existing org member once -> {email_lower: member_id}, cached. Read-only.
+        Used to map members that already exist in the org so their team assignments still apply."""
+        if getattr(self, "_existing_members", None) is not None:
+            return self._existing_members
+        out = {}
+        url = f"{self.base_url}/organizations/{org_slug}/members/"
+        params = None
+        try:
+            while url:
+                resp = requests.get(url, headers=self.headers, params=params)
+                resp.raise_for_status()
+                for m in resp.json():
+                    em = (m.get("email") or "").lower()
+                    if em and m.get("id"):
+                        out[em] = m.get("id")
+                url, params = self._next_link(resp.headers.get("Link")), None
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"  Could not list existing org members for id lookup: {e}")
+        self._existing_members = out
+        return out
+
+    def find_member_id_by_email(self, org_slug: str, email: str):
+        """Return an EXISTING org member's SaaS id by email (or None). Backed by a one-time cached
+        listing of all org members, so it doesn't depend on server-side email-query behavior."""
+        return self._load_existing_members(org_slug).get((email or "").lower())
+
 def main():
     parser = argparse.ArgumentParser(description='Add or delete members from Sentry organization')
     parser.add_argument('auth_token', help='Sentry authentication token')
-    parser.add_argument('org_slug', help='Organization slug')
+    parser.add_argument('org_slug', help='Destination SaaS organization slug')
+    parser.add_argument('export_file', nargs='?', help='JSON export file path (required unless --delete is used)')
+    parser.add_argument('--source-org', help='Source org slug to migrate (required when the export holds multiple orgs)')
     parser.add_argument('--delete', help='Delete members using mappings file', metavar='MAPPINGS_FILE')
-    parser.add_argument('--export-file', help='Export JSON file path for adding members')
     parser.add_argument('--test', help='Test mode with Gmail alias (e.g., your.email@gmail.com)', metavar='EMAIL')
-    parser.add_argument('--dry-run', action='store_true', help='Log intended API calls without sending them')
+    parser.add_argument('--run_on_real_data', type=lambda v: str(v).strip().lower() in ('true', '1', 'yes', 'y'),
+                        default=False, metavar='true|false',
+                        help='Set to true to actually perform changes. Default false = dry-run.')
+    parser.add_argument('--dry-run', action='store_true',
+                        help='(default) Dry-run is on by default; accepted for compatibility and is a no-op.')
     parser.add_argument('--send-invite', action='store_true', help='Send invitation emails (sets sendInvite/reinvite true)')
 
     args = parser.parse_args()
 
     try:
-        if args.dry_run:
-            logger.info("=== DRY RUN: no changes will be made to SaaS ===")
+        dry_run = not args.run_on_real_data
+        if dry_run:
+            logger.info("=== DRY RUN (default): no changes will be made to SaaS. Pass --run_on_real_data=true to apply. ===")
+        else:
+            logger.info("=== EXECUTE: changes WILL be made to SaaS ===")
         if args.send_invite:
             logger.info("=== send-invite ON: invitation emails will be sent ===")
-        manager = SentryMemberManager(args.auth_token, test_email=args.test, dry_run=args.dry_run, send_invite=args.send_invite)
-        
+        manager = SentryMemberManager(args.auth_token, test_email=args.test, dry_run=dry_run, send_invite=args.send_invite)
+
+        # Tag outputs with source org, dest org, and timestamp so per-org runs never overwrite.
+        tag = f"{args.source_org or 'allorgs'}_{args.org_slug}_{datetime.now():%Y%m%d_%H%M%S}"
+
         if args.delete:
             # Delete mode
             results = manager.delete_members(args.delete, args.org_slug)
-            
+
             logger.info("Member deletion completed:")
             logger.info(f"Deleted members: {len(results['deleted'])}")
             logger.info(f"Failed deletions: {len(results['failed'])}")
-            
+
             # Write deletion results to file
-            with open('member_deletion_results.json', 'w') as f:
+            out = f"member_deletion_results_{tag}.json"
+            with open(out, 'w') as f:
                 json.dump(results, f, indent=2)
-        
+            logger.info(f"Wrote {out}")
+
         elif args.export_file:
             # Add mode
-            results = manager.sync_members(args.export_file, args.org_slug)
-            
+            team_mappings_out = f"user_mappings_for_teams_{tag}.json"
+            results = manager.sync_members(args.export_file, args.org_slug, source_org=args.source_org,
+                                           team_mappings_out=team_mappings_out)
+
             logger.info("Member sync completed:")
             logger.info(f"Added members: {results['stats']['added']}")
+            logger.info(f"Already existed, mapped for team assignment: {results['stats'].get('existing_mapped', 0)}")
             logger.info(f"Failed additions: {results['stats']['failed']}")
-            logger.info(f"Skipped (inactive): {results['stats']['skipped']}")
-            
+            no_email = len(results['id_mappings'].get('skipped_no_email', {}))
+            logger.info(f"Skipped (inactive or no email): {results['stats']['skipped']}"
+                        + (f" (of which {no_email} had no email)" if no_email else ""))
+
             # Write results to file
-            with open('member_id_mappings.json', 'w') as f:
+            out = f"member_id_mappings_{tag}.json"
+            with open(out, 'w') as f:
                 json.dump(results, f, indent=2)
+            logger.info(f"Wrote {out}  (pass {team_mappings_out} to assign_team_members.py)")
         
         else:
-            parser.error("Either --delete or --export-file must be specified")
+            parser.error("Provide a positional export_file to add members, or --delete MAPPINGS_FILE to delete")
             
     except Exception as e:
         logger.error(f"Script execution failed: {str(e)}")
         sys.exit(1)
 
+
+import os as _rl_os, sys as _rl_sys
+_rl_sys.path.insert(0, _rl_os.path.join(_rl_os.path.dirname(_rl_os.path.abspath(__file__)), "..", "common"))
+_rl_sys.path.insert(0, _rl_os.path.join(_rl_os.path.dirname(_rl_os.path.abspath(__file__)), "common"))
+from run_logging import start_run_log
+
+
 if __name__ == "__main__":
-    main() 
+    start_run_log("add_sentry_members")
+    main()

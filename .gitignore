@@ -8,20 +8,30 @@ venv/
 # Runtime migration artifacts (generated at run time; may contain org data)
 export*.json
 *_mappings.json
-member_id_mappings.json
-user_mappings_for_teams.json
-project_team_sync_results.json
+member_id_mappings*.json
+user_mappings_for_teams*.json
+project_team_sync_results*.json
+project_management_results*.json
 team_mappings*.json
-project_management_results.json
-team_member_assignments.json
-member_deletion_results.json
+team_member_assignments*.json
+member_deletion_results*.json
 alert_rule_migration_results_*.json
 *_migration_results.json
-duplicate_report.json
-duplicate_report.html
+duplicate_*.json
+duplicate_*.html
 dryrun-out/
 .sh_read_token
 .saas_token
 
 # OS
 .DS_Store
+
+# Per-run console logs (may contain org data)
+*.log
+
+# Test-only Slack channel list (customer-specific names)
+slack_test_channels.txt
+
+# per-run collision / skip outputs (test artifacts)
+collision_skip_projects_*.json
+only_new_projects_skip.json

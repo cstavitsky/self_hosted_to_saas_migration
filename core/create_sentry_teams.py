@@ -3,6 +3,7 @@ import requests
 import logging
 from typing import Set, Dict, List
 from collections import defaultdict
+from datetime import datetime
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -33,7 +34,27 @@ class SentryTeamProjectMapper:
             logger.error(f"File not found: {export_file_path}")
             raise
 
-    def extract_mappings(self, data: List[Dict]) -> Dict[str, Dict]:
+    @staticmethod
+    def resolve_source_org_pk(data: List[Dict], source_org: str = None):
+        """Resolve which SOURCE org's records to migrate. An export may contain many orgs; team and
+        project records carry an `organization` FK (the source org pk). Returns that pk, or None
+        (no filter) only when the file holds a single org and no --source-org was given."""
+        orgs = {item.get('pk'): (item.get('fields') or {}).get('slug')
+                for item in data if isinstance(item, dict) and item.get('model') == 'sentry.organization'}
+        if source_org:
+            matches = [pk for pk, slug in orgs.items() if slug == source_org]
+            if not matches:
+                raise ValueError(f"--source-org '{source_org}' not found. Orgs in file: {sorted(filter(None, orgs.values()))}")
+            if len(matches) > 1:
+                raise ValueError(f"--source-org '{source_org}' is ambiguous (pks {matches} share this slug)")
+            return matches[0]
+        if len(orgs) > 1:
+            raise ValueError(
+                f"Export contains {len(orgs)} orgs {sorted(filter(None, orgs.values()))}; "
+                f"pass --source-org SLUG to migrate one at a time.")
+        return next(iter(orgs), None)
+
+    def extract_mappings(self, data: List[Dict], source_pk=None) -> Dict[str, Dict]:
         """
         Extract teams and projects with their relationships
         Returns:
@@ -59,18 +80,24 @@ class SentryTeamProjectMapper:
 
         # First pass: collect all teams and projects, and build relationships
         for item in data:
+            if not isinstance(item, dict):
+                continue
             if item.get('model') == 'sentry.team':
                 team_pk = item.get('pk')
-                fields = item.get('fields', {})
+                fields = item.get('fields', {}) or {}
+                if source_pk is not None and fields.get('organization') != source_pk:
+                    continue
                 if team_pk:
                     mappings['teams'][team_pk] = {
                         'slug': fields.get('slug', '').lower().replace(' ', '-'),
                         'name': fields.get('name')
                     }
                     logger.debug(f"Found team: {fields.get('name')} (PK: {team_pk})")
-            
+
             elif item.get('model') == 'sentry.project':
-                fields = item.get('fields', {})
+                fields = item.get('fields', {}) or {}
+                if source_pk is not None and fields.get('organization') != source_pk:
+                    continue
                 project_slug = fields.get('slug')
                 project_pk = item.get('pk')
                 if project_slug and project_pk:
@@ -151,9 +178,10 @@ class SentryTeamProjectMapper:
                 logger.error(f"Response: {e.response.text}")
             raise
 
-    def sync_project_teams(self, export_file_path: str, org_slug: str) -> Dict[str, List[str]]:
+    def sync_project_teams(self, export_file_path: str, org_slug: str, source_org: str = None) -> Dict[str, List[str]]:
         """
-        Sync team-project relationships from export file
+        Sync team-project relationships from export file. When the export holds multiple orgs,
+        `source_org` (a source org slug) selects which one's teams/projects to migrate.
         """
         results = {
             'teams_created': [],
@@ -163,11 +191,14 @@ class SentryTeamProjectMapper:
             'team_id_mappings': [],  # New field for storing old PK -> new ID mappings
             'mappings': {}
         }
-        
+
         try:
             # Load and process export data
             data = self.load_export_data(export_file_path)
-            mappings = self.extract_mappings(data)
+            source_pk = self.resolve_source_org_pk(data, source_org)
+            if source_pk is not None:
+                logger.info(f"Filtering to source org '{source_org or '(only org in file)'}' (pk {source_pk})")
+            mappings = self.extract_mappings(data, source_pk=source_pk)
             
             # Convert any sets in mappings to lists for JSON serialization
             for project_data in mappings['projects'].values():
@@ -225,9 +256,14 @@ def main():
 
     parser = argparse.ArgumentParser(description='Create Sentry teams and map them to projects')
     parser.add_argument('auth_token', help='Sentry authentication token')
-    parser.add_argument('org_slug', help='Organization slug')
+    parser.add_argument('org_slug', help='Destination SaaS organization slug')
     parser.add_argument('export_file', help='JSON export file path')
-    parser.add_argument('--dry-run', action='store_true', help='Log intended API calls without sending them')
+    parser.add_argument('--source-org', help='Source org slug to migrate (required when the export holds multiple orgs)')
+    parser.add_argument('--run_on_real_data', type=lambda v: str(v).strip().lower() in ('true', '1', 'yes', 'y'),
+                        default=False, metavar='true|false',
+                        help='Set to true to actually perform changes. Default false = dry-run.')
+    parser.add_argument('--dry-run', action='store_true',
+                        help='(default) Dry-run is on by default; accepted for compatibility and is a no-op.')
     args = parser.parse_args()
 
     auth_token = args.auth_token
@@ -235,10 +271,13 @@ def main():
     export_file = args.export_file
 
     try:
-        if args.dry_run:
-            logger.info("=== DRY RUN: no changes will be made to SaaS ===")
-        mapper = SentryTeamProjectMapper(auth_token, org_slug, dry_run=args.dry_run)
-        results = mapper.sync_project_teams(export_file, org_slug)
+        dry_run = not args.run_on_real_data
+        if dry_run:
+            logger.info("=== DRY RUN (default): no changes will be made to SaaS. Pass --run_on_real_data=true to apply. ===")
+        else:
+            logger.info("=== EXECUTE: changes WILL be made to SaaS ===")
+        mapper = SentryTeamProjectMapper(auth_token, org_slug, dry_run=dry_run)
+        results = mapper.sync_project_teams(export_file, org_slug, source_org=args.source_org)
         
         logger.info("Project-team sync completed:")
         logger.info(f"Teams created: {len(results['teams_created'])}")
@@ -246,13 +285,24 @@ def main():
         logger.info(f"Project mappings successful: {len(results['project_mappings_successful'])}")
         logger.info(f"Project mappings failed: {len(results['project_mappings_failed'])}")
         
-        # Write results to file
-        with open('project_team_sync_results.json', 'w') as f:
+        # Tag output with source org, dest org, and timestamp so per-org runs never overwrite.
+        tag = f"{args.source_org or 'allorgs'}_{args.org_slug}_{datetime.now():%Y%m%d_%H%M%S}"
+        out = f"project_team_sync_results_{tag}.json"
+        with open(out, 'w') as f:
             json.dump(results, f, indent=2)
-            
+        logger.info(f"Wrote {out}  (pass this to migrate_alert_rules.py)")
+
     except Exception as e:
         logger.error(f"Script execution failed: {str(e)}")
         sys.exit(1)
 
+
+import os as _rl_os, sys as _rl_sys
+_rl_sys.path.insert(0, _rl_os.path.join(_rl_os.path.dirname(_rl_os.path.abspath(__file__)), "..", "common"))
+_rl_sys.path.insert(0, _rl_os.path.join(_rl_os.path.dirname(_rl_os.path.abspath(__file__)), "common"))
+from run_logging import start_run_log
+
+
 if __name__ == "__main__":
+    start_run_log("create_sentry_teams")
     main()

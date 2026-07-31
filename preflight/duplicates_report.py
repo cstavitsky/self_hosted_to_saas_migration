@@ -2,28 +2,32 @@
 
 When several self-hosted orgs are consolidated into ONE SaaS org, project names, team slugs, and team
 names can collide -- and a team that exists in two orgs may have a *different roster* in each. This tool
-reads one JSON export per org and reports those overlaps BEFORE any migration runs, so they can be
+reads JSON exports and reports those overlaps BEFORE any migration runs, so they can be
 resolved (rename / merge / drop) up front.
 
-Source: JSON exports only (no live instance) -- see DECISIONS.md D7. One export file == one org.
+Source: JSON exports only (no live instance) -- see DECISIONS.md D7. Each export file may contain
+MANY orgs; records are bucketed to their org via the `organization` FK, and every org across every
+file is compared against every other in one pool.
 
 What counts as a hard blocker for a merged create (vs. informational):
-  - PROJECT collision        -> DANGER. Projects are created by name and SaaS derives the slug from it, so
-    projects whose names slugify to the same value clash. Detected on the DERIVED slug (slugify(name)),
-    which also catches different names that map to the same slug (e.g. "Payments API" vs "payments-api").
+  - PROJECT collision        -> DANGER. The migration sends each project's existing slug on create, so
+    SaaS preserves it; slugs must be unique within a merged SaaS org, so two projects that share a slug
+    clash. Detected on the ORIGINAL slug.
   - TEAM SLUG collision      -> DANGER. Teams are created with an explicit slug, which must be unique.
+    Collisions where the roster is IDENTICAL across the orgs are skipped (same slug + same people is
+    effectively one team, not a merge hazard); only same-slug/different-roster cases are flagged.
   - TEAM NAME collision      -> informational, but flagged with a MEMBERSHIP DIFF (same team name, but a
     different set of people in each org -- a real merge hazard).
   - SIMILAR ORG NAMES        -> informational (helps spot Dor-Org1 / Dor-Org2 / Dor-Org3 families).
 
 Usage:
-  python duplicates_report.py org1.json org2.json [org3.json ...] [--label PATH=DisplayName ...]
+  python duplicates_report.py export1.json [export2.json ...] [--label PATH=Prefix ...]
       [--similarity 0.6] [--out duplicate_report.json] [--html [duplicate_report.html]]
+  (--label prefixes the display name of every org in that file, e.g. Prefix:org-slug.)
 
 Writes duplicate_report.json (and, with --html, a self-contained duplicate_report.html) and exits
 non-zero if any HARD collision is found.
 """
-import re
 import sys
 import json
 import html as html_lib
@@ -41,62 +45,80 @@ def _norm(s: str) -> str:
     return (s or "").strip().lower()
 
 
-def slugify(name: str) -> str:
-    """Approximate how Sentry derives a project slug from its name (lowercase, non-alphanumeric -> '-').
-    This is what actually gets created on SaaS, so two names that slugify the same will clash."""
-    return re.sub(r"[^a-z0-9]+", "-", (name or "").strip().lower()).strip("-")
-
-
 def load(path: str):
     with open(path, "r") as f:
         return json.load(f)
 
 
-def build_org(path: str, data: list, label: str = None) -> dict:
-    """Reduce one export file to a compact per-org model.
+def build_orgs(path: str, data: list, label: str = None) -> list:
+    """Split ONE export file into its constituent orgs (a file may contain many).
 
-    Returns: {source_file, slug, name, teams: {slug: {slug,name,members:set}}, projects: [{slug,name}]}.
-    Team members are resolved within the file: organizationmemberteam(member_pk, team_pk) ->
-    organizationmember(user_email).
+    Records are bucketed to their owning org via the `organization` foreign key (an org pk)
+    carried by sentry.team, sentry.project, and sentry.organizationmember. Team rosters are
+    resolved within the file: organizationmemberteam(member_pk, team_pk) -> the team's org,
+    with the member's email from organizationmember(user_email|email). team_pk and member_pk
+    are unique within a file, so the member->team join is unambiguous across orgs.
+
+    Returns a list of per-org models, one per sentry.organization:
+      {id, source_file, slug, name, display, teams: {team_pk: {slug,name,members:set}},
+       projects: [{slug,name}]}.
+    `id` is unique per (file, org_pk) so orgs are never accidentally merged downstream.
     """
-    org_name = org_slug = None
-    teams = {}                      # team_pk -> {slug, name, members:set}
-    members = {}                    # member_pk -> email
-    project_list = []               # [{slug, name}]
+    orgs = {}                       # org_pk -> {name, slug}
+    teams = {}                      # team_pk -> {org, slug, name, members:set}
+    members = {}                    # member_pk -> {org, email}
+    projects = defaultdict(list)    # org_pk -> [{slug, name}]
     memberteam = []                 # (member_pk, team_pk)
 
-    for item in data:
+    for idx, item in enumerate(data):
+        if not isinstance(item, dict):
+            if item is None:
+                logger.warning(f"{path}: skipping null entry at index {idx}")
+            else:
+                logger.warning(
+                    f"{path}: skipping unexpected {type(item).__name__} entry at index {idx}: {item!r:.120}"
+                )
+            continue
         model = item.get("model")
         pk = item.get("pk")
-        f = item.get("fields", {})
+        f = item.get("fields", {}) or {}
         if model == "sentry.organization":
-            org_name = f.get("name")
-            org_slug = f.get("slug")
+            orgs[pk] = {"name": f.get("name"), "slug": f.get("slug")}
         elif model == "sentry.team":
-            teams[pk] = {"slug": f.get("slug"), "name": f.get("name"), "members": set()}
+            teams[pk] = {"org": f.get("organization"), "slug": f.get("slug"),
+                         "name": f.get("name"), "members": set()}
         elif model == "sentry.organizationmember":
-            email = f.get("user_email") or f.get("email")
-            if email:
-                members[pk] = email
+            members[pk] = {"org": f.get("organization"),
+                           "email": f.get("user_email") or f.get("email")}
         elif model == "sentry.organizationmemberteam":
             memberteam.append((f.get("organizationmember"), f.get("team")))
         elif model == "sentry.project":
-            project_list.append({"slug": f.get("slug"), "name": f.get("name")})
+            projects[f.get("organization")].append({"slug": f.get("slug"), "name": f.get("name")})
 
     for member_pk, team_pk in memberteam:
-        if team_pk in teams and member_pk in members:
-            teams[team_pk]["members"].add(members[member_pk])
+        t = teams.get(team_pk)
+        m = members.get(member_pk)
+        if t and m and m["email"]:
+            t["members"].add(m["email"])
 
-    # Identity precedence: explicit --label, then org slug, then org name, then filename.
-    display = label or org_slug or org_name or path.rsplit("/", 1)[-1]
-    return {
-        "source_file": path,
-        "slug": org_slug or display,
-        "name": org_name or display,
-        "display": display,
-        "teams": teams,
-        "projects": project_list,
-    }
+    basename = path.rsplit("/", 1)[-1]
+    result = []
+    for org_pk, o in orgs.items():
+        # Identity precedence: explicit --label prefix, then org slug, then org name, then file#pk.
+        base_display = o["slug"] or o["name"] or f"{basename}#{org_pk}"
+        display = f"{label}:{base_display}" if label else base_display
+        org_teams = {tpk: {"slug": t["slug"], "name": t["name"], "members": t["members"]}
+                     for tpk, t in teams.items() if t["org"] == org_pk}
+        result.append({
+            "id": f"{basename}#{org_pk}",
+            "source_file": path,
+            "slug": o["slug"] or display,
+            "name": o["name"] or display,
+            "display": display,
+            "teams": org_teams,
+            "projects": projects.get(org_pk, []),
+        })
+    return result
 
 
 def _group(orgs, extractor):
@@ -111,14 +133,14 @@ def _group(orgs, extractor):
 
 
 def project_collisions(orgs):
-    """Group projects across orgs by their DERIVED slug (slugify(name)). The migration creates projects by
-    name and SaaS derives the slug, so a shared derived slug is what actually clashes in a merged org --
-    this also catches different names that slugify to the same value (e.g. 'Payments API' vs 'payments-api')."""
+    """Group projects across orgs by their ORIGINAL slug. The migration sends each project's existing
+    slug on create, so SaaS preserves it; slugs must be unique within a merged org, so two projects
+    that share a slug are what actually clash. Every Sentry project has a slug, so no fallback."""
     def extract(o):
         rows = []
         for p in o["projects"]:
-            derived = slugify(p["name"]) or _norm(p["slug"])
-            rows.append((derived, {"slug": p["slug"], "name": p["name"], "derived": derived}))
+            key = _norm(p["slug"])
+            rows.append((key, {"slug": p["slug"], "name": p["name"], "key": key}))
         return rows
     return _group(orgs, extract)
 
@@ -176,7 +198,7 @@ def _print_project_section(title, dups, note):
         return
     for key, group in sorted(dups.items()):
         where = ", ".join(f"{org} (name '{p['name']}', slug '{p['slug']}')" for org, p in group)
-        logger.info(f"  derived-slug '{key}' in {len(group)} orgs: {where}   [{note}]")
+        logger.info(f"  slug '{key}' in {len(group)} orgs: {where}   [{note}]")
 
 
 def _print_team_section(title, collisions, note):
@@ -207,22 +229,19 @@ def _html_project_section(title, note_class, dups):
     for key, group in sorted(dups.items()):
         items = []
         for item in group:
-            note = ""
-            if _norm(item["slug"]) != _norm(item.get("derived_slug", "")):
-                note = f' <span class="note">(source slug <code>{esc(item["slug"])}</code>)</span>'
             items.append(
-                f'<li><span class="org">{esc(item["org"])}</span> '
-                f'&mdash; name &ldquo;{esc(item["name"])}&rdquo;{note}</li>'
+                f'<li data-org="{esc(item["org"])}"><span class="org">{esc(item["org"])}</span> '
+                f'&mdash; slug <code>{esc(item["slug"])}</code>, name &ldquo;{esc(item["name"])}&rdquo;</li>'
             )
         orgs = "".join(items)
         rows.append(
-            f'<tr><td class="key"><code>{esc(key)}</code></td>'
+            f'<tr data-group="project"><td class="key"><code>{esc(key)}</code></td>'
             f'<td><span class="badge {note_class}">{esc(note_class.upper())}</span></td>'
             f'<td><ul class="orglist">{orgs}</ul></td></tr>'
         )
     return (
         f'<section><h2>{esc(title)}</h2>'
-        f'<table><thead><tr><th>Derived slug</th><th>Severity</th><th>Appears in</th></tr></thead>'
+        f'<table><thead><tr><th>Slug</th><th>Severity</th><th>Appears in</th></tr></thead>'
         f'<tbody>{"".join(rows)}</tbody></table></section>'
     )
 
@@ -232,11 +251,6 @@ def _html_team_section(title, note_class, collisions, key_noun="team"):
         return f'<section><h2>{esc(title)}</h2><p class="empty">none</p></section>'
     blocks = []
     for key, info in sorted(collisions.items()):
-        diff_badge = (
-            '<span class="badge different">DIFFERENT rosters</span>'
-            if not info["identical_rosters"]
-            else '<span class="badge same">identical rosters</span>'
-        )
         common = (
             ", ".join(esc(m) for m in info["common_members"]) if info["common_members"] else "(none)"
         )
@@ -244,8 +258,10 @@ def _html_team_section(title, note_class, collisions, key_noun="team"):
         for org_display, m in info["membership"].items():
             members = ", ".join(esc(x) for x in m["members"]) or "(none)"
             unique = ", ".join(esc(x) for x in m["unique_to_this_org"]) or "(none)"
+            members_json = esc(json.dumps(m["members"]))
             per_org.append(
-                f'<div class="orgroster"><div class="org"><span class="mlabel">organization:</span> {esc(org_display)}</div>'
+                f'<div class="orgroster" data-org="{esc(org_display)}" data-members="{members_json}">'
+                f'<div class="org"><span class="mlabel">organization:</span> {esc(org_display)}</div>'
                 f'<div class="mline"><span class="mlabel">members:</span> {members}</div>'
                 f'<div class="mline"><span class="mlabel">unique to this org:</span> '
                 f'<span class="unique">{unique}</span></div></div>'
@@ -254,9 +270,10 @@ def _html_team_section(title, note_class, collisions, key_noun="team"):
             f'<div class="teamblock">'
             f'<div class="teamhead"><span class="keylabel">duplicate {esc(key_noun)}:</span> '
             f'<code class="key">{esc(info["label"])}</code> '
-            f'<span class="badge {note_class}">{esc(note_class.upper())}</span> {diff_badge} '
+            f'<span class="badge {note_class}">{esc(note_class.upper())}</span> '
+            f'<span class="badge different roster-badge">{"DIFFERENT rosters" if not info["identical_rosters"] else "identical rosters"}</span> '
             f'<span class="inorgs">in {esc(", ".join(info["orgs"]))}</span></div>'
-            f'<div class="common"><span class="mlabel">common members:</span> {common}</div>'
+            f'<div class="common"><span class="mlabel">common members:</span> <span class="common-val">{common}</span></div>'
             f'<div class="rosters">{"".join(per_org)}</div></div>'
         )
     return f'<section><h2>{esc(title)}</h2>{"".join(blocks)}</section>'
@@ -268,7 +285,7 @@ def render_html(report: dict, exports: list, generated_at: str) -> str:
     hard_class = "danger" if hard else "ok"
 
     org_cards = "".join(
-        f'<div class="card"><div class="cardname">{esc(o["display"])}</div>'
+        f'<div class="card" data-org="{esc(o["display"])}"><div class="cardname">{esc(o["display"])}</div>'
         f'<div class="cardsub">{esc(o["name"])}</div>'
         f'<div class="cardstats">{o["teams"]} teams &middot; {o["projects"]} projects</div>'
         f'<div class="cardfile"><code>{esc(o["source_file"])}</code></div></div>'
@@ -276,6 +293,108 @@ def render_html(report: dict, exports: list, generated_at: str) -> str:
     )
 
     files = ", ".join(esc(f) for f in exports)
+
+    # Plain (non-f) string so JS braces don't need escaping. Recomputes the view when orgs are
+    # toggled: a collision row stays visible only if >=2 still-selected orgs share it, and team
+    # rosters/common/unique members are recomputed among the selected orgs.
+    script = """<script>
+(function () {
+  var deselected = new Set();
+
+  function recompute() {
+    // Project rows: keep row only if >=2 selected orgs still share the slug.
+    document.querySelectorAll('tr[data-group="project"]').forEach(function (tr) {
+      var visible = 0;
+      tr.querySelectorAll('li[data-org]').forEach(function (li) {
+        var off = deselected.has(li.getAttribute('data-org'));
+        li.style.display = off ? 'none' : '';
+        if (!off) visible++;
+      });
+      tr.style.display = visible >= 2 ? '' : 'none';
+    });
+
+    // Team blocks: recompute rosters, common, unique among selected orgs.
+    document.querySelectorAll('.teamblock').forEach(function (tb) {
+      var rosters = [].slice.call(tb.querySelectorAll('.orgroster[data-org]'));
+      var shown = [];
+      rosters.forEach(function (r) {
+        var off = deselected.has(r.getAttribute('data-org'));
+        r.style.display = off ? 'none' : '';
+        if (!off) shown.push(r);
+      });
+      var names = shown.map(function (r) { return r.getAttribute('data-org'); });
+      var sets = shown.map(function (r) {
+        try { return JSON.parse(r.getAttribute('data-members') || '[]'); } catch (e) { return []; }
+      });
+      var common = sets.length
+        ? sets[0].filter(function (m) { return sets.every(function (s) { return s.indexOf(m) !== -1; }); })
+        : [];
+      shown.forEach(function (r, i) {
+        var others = sets.filter(function (_, j) { return j !== i; });
+        var uniq = sets[i].filter(function (m) {
+          return !others.some(function (s) { return s.indexOf(m) !== -1; });
+        });
+        var uEl = r.querySelector('.unique');
+        if (uEl) uEl.textContent = uniq.length ? uniq.join(', ') : '(none)';
+      });
+      var cEl = tb.querySelector('.common-val');
+      if (cEl) cEl.textContent = common.length ? common.join(', ') : '(none)';
+      var inEl = tb.querySelector('.inorgs');
+      if (inEl) inEl.textContent = names.length ? ('in ' + names.join(', ')) : '';
+      var identical = sets.length >= 2 && sets.every(function (s) {
+        return s.length === sets[0].length && s.every(function (m) { return sets[0].indexOf(m) !== -1; });
+      });
+      var b = tb.querySelector('.roster-badge');
+      if (b) b.textContent = identical ? 'identical rosters' : 'DIFFERENT rosters';
+      // Show only when >=2 selected orgs share the team AND their rosters differ (identical
+      // rosters are treated as the same team and skipped).
+      tb.style.display = (names.length >= 2 && !identical) ? '' : 'none';
+    });
+
+    updateCounts();
+  }
+
+  function visibleCount(sel) {
+    return [].filter.call(document.querySelectorAll(sel), function (el) {
+      return el.style.display !== 'none';
+    }).length;
+  }
+
+  function setText(id, v) { var el = document.getElementById(id); if (el) el.textContent = v; }
+
+  function updateCounts() {
+    var proj = visibleCount('tr[data-group="project"]');
+    var team = visibleCount('.teamblock');
+    var hard = proj + team;
+    setText('count-project', proj);
+    setText('count-teamslug', team);
+    setText('count-hard', hard);
+    setText('bignum', hard);
+    var big = document.getElementById('bignum');
+    if (big) { big.classList.toggle('danger', hard > 0); big.classList.toggle('ok', hard === 0); }
+    var cards = document.querySelectorAll('.card[data-org]');
+    setText('org-status', (cards.length - deselected.size) + ' of ' + cards.length + ' orgs shown');
+  }
+
+  document.querySelectorAll('.card[data-org]').forEach(function (card) {
+    function toggle() {
+      var org = card.getAttribute('data-org');
+      if (deselected.has(org)) { deselected.delete(org); card.classList.remove('deselected'); card.setAttribute('aria-pressed', 'true'); }
+      else { deselected.add(org); card.classList.add('deselected'); card.setAttribute('aria-pressed', 'false'); }
+      recompute();
+    }
+    card.setAttribute('role', 'button');
+    card.setAttribute('tabindex', '0');
+    card.setAttribute('aria-pressed', 'true');
+    card.addEventListener('click', toggle);
+    card.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(); }
+    });
+  });
+
+  recompute();
+})();
+</script>"""
 
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -300,8 +419,17 @@ def render_html(report: dict, exports: list, generated_at: str) -> str:
     color: #666; margin-bottom: 8px; }}
   .legitem {{ font-size: 13px; margin-bottom: 6px; }}
   .legitem .badge {{ margin-right: 8px; vertical-align: middle; }}
+  .orgcontrols {{ font-size: 13px; color: #666; margin-bottom: 8px; }}
+  .orgcontrols b {{ color: #1a1a1a; }}
   .cards {{ display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 24px; }}
-  .card {{ border: 1px solid #e2e2e2; border-radius: 8px; padding: 12px 14px; min-width: 160px; }}
+  .card {{ border: 1px solid #e2e2e2; border-radius: 8px; padding: 12px 14px; min-width: 160px;
+    cursor: pointer; user-select: none; position: relative; transition: opacity .12s, border-color .12s; }}
+  .card:hover {{ border-color: #999; }}
+  .card::before {{ content: "\\2713"; position: absolute; top: 8px; right: 10px; font-size: 12px;
+    font-weight: 700; color: #1e7e34; }}
+  .card.deselected {{ opacity: .45; }}
+  .card.deselected::before {{ content: "\\2715"; color: #b3261e; }}
+  .card.deselected .cardname {{ text-decoration: line-through; }}
   .cardname {{ font-weight: 600; }}
   .cardsub {{ color: #666; font-size: 13px; }}
   .cardstats {{ margin-top: 6px; font-size: 13px; }}
@@ -351,10 +479,11 @@ def render_html(report: dict, exports: list, generated_at: str) -> str:
   <div class="meta">Generated {esc(generated_at)} &middot; sources: <code>{files}</code></div>
 
   <div class="summary">
-    <div class="bignum {hard_class}">{hard}</div>
+    <div class="bignum {hard_class}" id="bignum">{hard}</div>
     <div class="counts">
-      <div><b>{hard}</b> Danger collision group(s) &mdash; block a merged migration</div>
-      <div>project {s["project_collisions"]} &middot; team-slug {s["team_slug_collisions"]}
+      <div><b id="count-hard">{hard}</b> Danger collision group(s) &mdash; block a merged migration</div>
+      <div>project <span id="count-project">{s["project_collisions"]}</span> &middot;
+        team-slug <span id="count-teamslug">{s["team_slug_collisions"]}</span>
         &middot; team-name {s["team_name_collisions"]} (info) &middot;
         similar-names {s["similar_org_name_pairs"]} (info)</div>
     </div>
@@ -364,23 +493,26 @@ def render_html(report: dict, exports: list, generated_at: str) -> str:
     <div class="legtitle">Severity reference</div>
     <div class="legitem"><span class="badge danger">DANGER</span>Will break a merged migration: the
       create fails or silently merges into the wrong object. Resolve (rename / merge / drop) before
-      migrating. Any Danger group makes the tool exit non-zero. Covers project collisions (names that map
-      to the same derived slug) and team-slug collisions.</div>
+      migrating. Any Danger group makes the tool exit non-zero. Covers project collisions (projects
+      that share a slug) and team-slug collisions.</div>
   </div>
 
+  <div class="orgcontrols">Click an org to include or exclude it from the analysis below.
+    <b id="org-status"></b></div>
   <div class="cards">{org_cards}</div>
 
-  {_html_project_section("Project collisions (Danger - names map to the same derived slug)", "danger", report["project_collisions_HARD"])}
+  {_html_project_section("Project collisions (Danger - projects share a slug)", "danger", report["project_collisions_HARD"])}
   {_html_team_section("Team slug collisions (Danger - slug must be unique)", "danger", report["team_slug_collisions_HARD"], "team slug")}
+{script}
 </body></html>
 """
 
 
 def main():
     parser = argparse.ArgumentParser(description="Cross-org duplicates/collision report from JSON exports")
-    parser.add_argument("exports", nargs="+", help="One export.json per org")
-    parser.add_argument("--label", action="append", default=[], metavar="PATH=NAME",
-                        help="Override an org's display name for a given export path (repeatable)")
+    parser.add_argument("exports", nargs="+", help="One or more export.json files (each may hold many orgs)")
+    parser.add_argument("--label", action="append", default=[], metavar="PATH=PREFIX",
+                        help="Prefix the display name of every org from a given export path (repeatable)")
     parser.add_argument("--similarity", type=float, default=0.6,
                         help="Org-name similarity threshold 0..1 for the 'similar names' section (default 0.6)")
     parser.add_argument("--out", default="duplicate_report.json", help="Output JSON path")
@@ -396,17 +528,31 @@ def main():
 
     orgs = []
     for path in args.exports:
-        org = build_org(path, load(path), label=labels.get(path))
-        orgs.append(org)
-        logger.info(f"Loaded {path}: org '{org['display']}' "
-                    f"({len(org['teams'])} teams, {len(org['projects'])} projects)")
+        file_orgs = build_orgs(path, load(path), label=labels.get(path))
+        orgs.extend(file_orgs)
+        summary = ", ".join(f"{o['display']} ({len(o['teams'])}t/{len(o['projects'])}p)" for o in file_orgs)
+        logger.info(f"Loaded {path}: {len(file_orgs)} org(s) -> {summary}")
+
+    # Displays are the dedup key in the collision grouping, so they must be unique across the
+    # pool -- otherwise two orgs that happen to share a slug would be collapsed and their
+    # clashes hidden. Disambiguate any duplicate display with its source file + org pk.
+    by_display = defaultdict(list)
+    for o in orgs:
+        by_display[o["display"]].append(o)
+    for disp, group in by_display.items():
+        if len(group) > 1:
+            for o in group:
+                o["display"] = f"{disp} [{o['id']}]"
 
     proj_dups = project_collisions(orgs)
     team_slug_dups = team_collisions_with_membership(orgs, "slug")
+    # Skip team-slug collisions whose rosters are identical across the orgs: same slug + same people
+    # is effectively the same team, not a merge hazard worth flagging.
+    team_slug_dups = {k: v for k, v in team_slug_dups.items() if not v["identical_rosters"]}
     team_name_dups = team_collisions_with_membership(orgs, "name")
     similar = similar_org_names(orgs, args.similarity)
 
-    _print_project_section("PROJECT collisions (DANGER - names map to the same derived slug)", proj_dups, "DANGER")
+    _print_project_section("PROJECT collisions (DANGER - projects share a slug)", proj_dups, "DANGER")
     _print_team_section("TEAM SLUG collisions (DANGER - slug must be unique)", team_slug_dups, "DANGER")
     _print_team_section("TEAM NAME collisions (INFO - watch roster diffs)", team_name_dups, "info")
 
@@ -418,7 +564,7 @@ def main():
         logger.info("  none above threshold")
 
     def _proj_json(dups):
-        return {k: [{"org": o, "slug": p["slug"], "name": p["name"], "derived_slug": p["derived"]}
+        return {k: [{"org": o, "slug": p["slug"], "name": p["name"], "match_key": p["key"]}
                     for o, p in g] for k, g in dups.items()}
 
     report = {
@@ -462,5 +608,12 @@ def main():
     logger.info("\nNo hard collisions detected.")
 
 
+import os as _rl_os, sys as _rl_sys
+_rl_sys.path.insert(0, _rl_os.path.join(_rl_os.path.dirname(_rl_os.path.abspath(__file__)), "..", "common"))
+_rl_sys.path.insert(0, _rl_os.path.join(_rl_os.path.dirname(_rl_os.path.abspath(__file__)), "common"))
+from run_logging import start_run_log
+
+
 if __name__ == "__main__":
+    start_run_log("duplicates_report")
     main()

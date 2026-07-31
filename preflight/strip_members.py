@@ -34,8 +34,8 @@ DEFAULT_MODELS = [
     "sentry.organizationmemberinvite",  # email
     "sentry.authidentity",            # ident (SSO identity, ~always an email)
     # Config records that embed emails in generic text fields.
-    "sentry.alertruletriggeraction",  # target_identifier / target_display
-    "sentry.notificationaction",      # target_identifier / target_display
+    # "sentry.alertruletriggeraction",  # target_identifier / target_display
+    # "sentry.notificationaction",      # target_identifier / target_display
     "sentry.projectownership",        # raw (ownership rules with emails)
 ]
 

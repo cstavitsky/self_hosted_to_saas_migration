@@ -368,17 +368,19 @@ def main():
             logger.info(f"  excluded    : {len(accounting['excluded_advanced'])} advanced custom-PII "
                         f"option(s) not migrated (see DECISIONS.md D5): {', '.join(accounting['excluded_advanced'])}")
 
-        migrator.update_project(args.dest_org, dest_slug, payload)
-
         mismatches = {}
-        if args.dry_run:
-            logger.info("  verify      : skipped (dry-run)")
-        else:
-            mismatches = migrator.verify(args.dest_org, dest_slug, payload)
-            if mismatches:
-                logger.warning(f"  verify      : MISMATCH {_fmt(mismatches, 200)}")
+        if payload:
+            migrator.update_project(args.dest_org, dest_slug, payload)
+            if args.dry_run:
+                logger.info("  verify      : skipped (dry-run)")
             else:
-                logger.info("  verify      : passed")
+                mismatches = migrator.verify(args.dest_org, dest_slug, payload)
+                if mismatches:
+                    logger.warning(f"  verify      : MISMATCH {_fmt(mismatches, 200)}")
+                else:
+                    logger.info("  verify      : passed")
+        else:
+            logger.info("  action      : no settings to apply -- skipped (no PUT)")
 
         # --- Inbound filters (dedicated /filters/ endpoint; one PUT per filter) ---
         filter_mismatches = {}
